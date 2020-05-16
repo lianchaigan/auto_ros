@@ -1,0 +1,482 @@
+/******************************************************************************
+ @filename		Uart.c
+
+ @project		UART hardware driver
+ 
+ @description		
+ 
+ @version		1.0.0
+
+ @revision		
+******************************************************************************/
+
+#include "Common.h"
+#include "Serial.h"
+#include "Hal.h"
+
+
+/******************************************************************************
+ Define
+******************************************************************************/
+#define TOTAL_PORT				4U
+
+
+/******************************************************************************
+ Export functions
+******************************************************************************/
+static int UartInit( void *pHandle, uint8_t nPort, uint32_t nBaud );
+static void UartSetIrqLevel( void const	*pHandle, uint32_t nLevel );
+static int UartSetBaud( void const *pHandle, uint32_t nBaud );
+static int UartSetCfg( void const *pHandle, UART_CFG Databit, UART_CFG Parity, UART_CFG Stopbit );
+static int UartLoopback( void const *pHandle, int bEnable );
+static void UartWrite( void const *pHandle, char Data );
+static char UartRead( void const *pHandle );
+static int UartIsTxEnd( void const *pHandle );
+static int UartIsTxReady( void const *pHandle );
+static int UartIsRxReady( void const *pHandle );
+static void UartTxEnd( void const *pHandle );
+static void UartLock( void const *pHandle );
+static void UartUnlock( void const *pHandle );
+
+
+/******************************************************************************
+ Global variables
+******************************************************************************/
+UART_DRIVER const STM32F722X_UART_DRV = 
+{
+	UartInit,
+	UartSetBaud,
+	UartSetCfg,
+	UartSetIrqLevel,
+	UartLoopback,
+	UartWrite,
+	UartRead,
+	UartIsTxEnd,
+	UartIsTxReady,
+	UartIsRxReady,
+	UartTxEnd,
+	UartLock,
+	UartUnlock
+};
+
+
+/******************************************************************************
+ Local variables
+******************************************************************************/
+static volatile PUART_HANDLE g_UartIrqHandles[TOTAL_PORT];
+static volatile int g_bToggle = 0;
+
+/******************************************************************************
+ Implementations
+******************************************************************************/
+static int
+UartInit(
+	void		*pHandle,
+	uint8_t		nPort,
+	uint32_t	nBaud
+	)
+{
+	USART_TypeDef 		*uart;
+	IRQn_Type 			irq;
+	int32_t				div;
+	double 				frac;
+	uint8_t				port;
+	int32_t				fdr;
+	UART_HANDLE 		*handle = (UART_HANDLE *)pHandle;
+	
+	ASSERT( 0 != pHandle );
+	
+	/* Determined base port pointer and 
+	   Enable the clock to the selected UART */
+	switch( nPort )
+	{
+		case 4:
+			port = 0;
+			uart = UART4;
+			irq = UART4_IRQn;
+		break;
+
+		case 5:
+			port = 1;
+			uart = UART5;
+			irq = UART5_IRQn;
+		break;
+		
+		case 7:
+			port = 2;
+			uart = UART7;
+			irq = UART7_IRQn;
+		break;
+		
+		case 8:
+			port = 3;
+			uart = UART8;
+			irq = UART8_IRQn;
+		break;
+
+		default:
+			return UART_STS_NO_PORT;
+	}
+	
+	/* Store uart parameters */
+	handle->pUART 	= uart;
+	handle->Irq 	= irq;
+
+	/* Keep a copy of handle for the port */
+	g_UartIrqHandles[port] = handle;
+	
+	/* Enable UART */
+	uart->CR1 |= USART_CR1_UE;
+	
+	/* Calculate the clock frequency into UART */
+	div = (SystemCoreClock>>1U) / (16U * nBaud); 
+	frac =  (double)(SystemCoreClock>>1U) / (double)(16U * nBaud); 
+	frac = frac - div;
+	fdr = frac*16;
+	
+	if( fdr<15 )
+	{
+		uart->BRR = (div<<4U) | fdr;
+	}
+	else
+	{
+		uart->BRR = (div<<4U);
+	}
+	
+	/* Turn on tranmit empty and receive ready interrupt */
+	uart->CR1 |= USART_CR1_RXNEIE | USART_CR1_RE | USART_CR1_TE;
+	
+	/* Enable UART NVIC interrupt */
+	NVIC_EnableIRQ( irq );
+	
+	return UART_STS_OK;
+}
+
+
+static int
+UartSetBaud(
+	void const 	*pHandle,
+	uint32_t 	nBaud
+	)
+{
+	int32_t	div;
+	UART_HANDLE const *handle = (UART_HANDLE const *)pHandle;
+	USART_TypeDef *uart = (USART_TypeDef *)handle->pUART;
+	
+	ASSERT( 0 != pHandle );
+	
+	NVIC_DisableIRQ( (IRQn_Type)handle->Irq );
+	
+	div = SystemCoreClock / (16U * nBaud); 
+	uart->BRR = div<<4U;
+	
+	uart->CR1 |= USART_CR1_RE | USART_CR1_TE;
+	
+	/* Enable UART NVIC interrupt */
+	NVIC_EnableIRQ( (IRQn_Type)handle->Irq );
+	
+	return UART_STS_OK;
+}
+
+
+static int
+UartSetCfg(
+	void const 	*pHandle,
+	UART_CFG 	Databit,
+	UART_CFG 	Parity,
+	UART_CFG 	Stopbit
+	)
+{
+	UART_HANDLE const 	*handle = (UART_HANDLE const *)pHandle;
+	USART_TypeDef 	*uart 	= (USART_TypeDef *)handle->pUART;
+
+	ASSERT( 0 != pHandle );
+	
+	uart->CR1 &= ~USART_CR1_PCE;
+	uart->CR2 &= ~(USART_CR2_CPOL | USART_CR2_STOP);
+	//uart->CR2 |= USART_CR2_CPHA;
+
+
+    /* Configure the UART's databit */
+    switch( Databit )
+	{
+		case UART_BITS_8:
+			uart->CR1 &= ~USART_CR1_M;
+		break;
+			
+		case UART_BITS_9:
+			uart->CR1 |= USART_CR1_M;
+		break;
+		
+		default:
+			return UART_STS_NO_CFG;
+    }
+	
+	/* Configure parity */
+    switch( Parity )
+	{
+		case UART_NONE:
+			uart->CR1 &= ~USART_CR1_PCE;	/* Disable parity */
+		break;
+			
+		case UART_EVEN:
+			uart->CR1 |= USART_CR1_PCE;
+			uart->CR1 &= ~USART_CR1_PS;		/* Even parity */
+		break;
+
+		case UART_ODD:
+			uart->CR1 |= USART_CR1_PCE
+						| USART_CR1_PS;		/* Odd parity */
+		break;
+
+		default:
+			return UART_STS_NO_CFG;
+    }
+
+	/* Configure stopbit */
+	uart->CR2 &= ~USART_CR2_STOP;
+    switch( Stopbit )
+	{
+		case UART_DEFAULT:
+		case UART_ONE:
+		break;
+		
+		case UART_TWO:
+			uart->CR2 |= USART_CR2_STOP_1;
+		break;
+		
+		default:
+			return UART_STS_NO_CFG;
+    }
+
+	return UART_STS_OK;
+}
+
+
+static void
+UartSetIrqLevel(
+	void const *pHandle,
+	uint32_t 	nLevel
+	)
+{
+	UART_HANDLE const *handle = (UART_HANDLE const *)pHandle;
+	
+	ASSERT( 0 != pHandle );
+	
+	NVIC_SetPriority( (IRQn_Type)handle->Irq, nLevel );
+}
+
+
+static int
+UartLoopback(
+	void const *pHandle,
+	int 		bEnable
+	)
+{
+	ASSERT( 0 != pHandle );
+	
+	/* No implemantation. LPC17XX not supported */
+	return UART_STS_OK;
+}
+
+
+static void
+UartWrite(
+	void const 	*pHandle,
+	char 		Data
+	)
+{
+	UART_HANDLE const 	*handle = (UART_HANDLE const *)pHandle;
+	USART_TypeDef 	*uart 	= (USART_TypeDef *)handle->pUART;
+
+	ASSERT( 0 != pHandle );
+	
+	/* Write data to transmit holder register */
+	uart->TDR = Data;
+	
+	/* Enable interrupt */
+	uart->CR1 |= USART_CR1_TXEIE;
+}
+
+
+static char UartRead( void const *pHandle )
+{
+	UART_HANDLE const 	*handle = (UART_HANDLE const *)pHandle;
+	USART_TypeDef 	*uart 	= (USART_TypeDef *)handle->pUART;
+
+	ASSERT( 0 != pHandle );
+	
+	return uart->RDR;
+}
+
+
+static int UartIsTxEnd( void const *pHandle )
+{
+	UART_HANDLE const 	*handle = (UART_HANDLE const *)pHandle;
+	USART_TypeDef 	*uart 	= (USART_TypeDef *)handle->pUART;
+	
+	ASSERT( 0 != pHandle );
+	
+	return ((uart->CR1 & USART_CR1_TXEIE) ? FALSE : TRUE);
+}
+
+
+static int UartIsTxReady( void const *pHandle )
+{
+	UART_HANDLE const 	*handle = (UART_HANDLE const *)pHandle;
+	USART_TypeDef 	*uart 	= (USART_TypeDef *)handle->pUART;
+	
+	ASSERT( 0 != pHandle );
+	
+    return (( 0 != (uart->ISR & USART_ISR_TXE) ) ? TRUE : FALSE);
+}
+
+
+static int UartIsRxReady( void const *pHandle )
+{
+	UART_HANDLE const 	*handle = (UART_HANDLE const *)pHandle;
+	USART_TypeDef 	*uart 	= (USART_TypeDef *)handle->pUART;
+	
+	ASSERT( 0 != pHandle );
+	
+    return ((uart->ISR & USART_ISR_RXNE) ? TRUE : FALSE);
+}
+
+
+static void UartTxEnd( void const *pHandle )
+{
+	UART_HANDLE const 	*handle = (UART_HANDLE const *)pHandle;
+	USART_TypeDef 	*uart 	= (USART_TypeDef *)handle->pUART;
+	
+	ASSERT( 0 != pHandle );
+	
+	/* Disable interrupt */
+	uart->CR1 &= ~USART_CR1_TXEIE;
+}
+
+
+static void UartLock( void const *pHandle )
+{
+	UART_HANDLE const *handle = (UART_HANDLE const *)pHandle;
+	
+	ASSERT( 0 != pHandle );
+	
+	NVIC_DisableIRQ( (IRQn_Type)handle->Irq );
+}
+
+
+static void UartUnlock( void const *pHandle )
+{
+	UART_HANDLE const *handle = (UART_HANDLE const *)pHandle;
+	
+	ASSERT( 0 != pHandle );
+	
+	NVIC_EnableIRQ( (IRQn_Type)handle->Irq );
+}
+
+
+/******************************************************************************
+ Interrupt Service Routines
+******************************************************************************/
+void UART4_IRQHandler( void ) __attribute__ ((interrupt));
+void UART4_IRQHandler( void )
+{
+	USART_TypeDef *uart = UART4;
+	int status 	= uart->ISR;
+	
+	ASSERT( 0 != g_UartIrqHandles[0] );
+	
+	/* Check for Tx IRQ */
+	if( 0 != (status & USART_ISR_TC) )
+	{
+		UartIsrTx( g_UartIrqHandles[0] );
+	}
+
+    /* Check for Rx IRQ */
+	if( 0 != (status & USART_ISR_RXNE) )
+	{
+		UartIsrRx( g_UartIrqHandles[0] );
+	}
+}
+
+void UART5_IRQHandler( void ) __attribute__ ((interrupt));
+void UART5_IRQHandler( void )
+{
+	USART_TypeDef *uart = UART5;
+	int status = uart->ISR;
+	
+	ASSERT( 0 != g_UartIrqHandles[1] );
+
+	/* Check for Tx IRQ */
+	if( 0 != (status & USART_ISR_TC) )
+	{
+		UartIsrTx( g_UartIrqHandles[1] );
+	}
+	
+    /* Check for Rx IRQ */
+	if( 0 != (status & USART_ISR_RXNE) )
+	{
+		UartIsrRx( g_UartIrqHandles[1] );
+	}
+}
+
+void UART7_IRQHandler( void ) __attribute__ ((interrupt));
+void UART7_IRQHandler( void )
+{
+	USART_TypeDef *uart = UART7;
+	int status = uart->ISR;
+	
+	ASSERT( 0 != g_UartIrqHandles[2] );
+	
+	/* Check for Tx IRQ */
+	if( 0 != (status & USART_ISR_TC) )
+	{
+		UartIsrTx( g_UartIrqHandles[2] );
+	}
+
+    /* Check for Rx IRQ */
+	if( 0 != (status & USART_ISR_RXNE) )
+	{
+		UartIsrRx( g_UartIrqHandles[2] );
+	}
+}
+
+
+void UART8_IRQHandler (void) __attribute__ ((interrupt));
+void UART8_IRQHandler( void )
+{
+	USART_TypeDef *uart = UART8;
+	int status = uart->ISR;
+	
+	ASSERT( 0 != g_UartIrqHandles[3] );
+	
+	/* Check for Tx IRQ */
+	if( 0 != (status & USART_ISR_TC) )
+	{
+		UartIsrTx( g_UartIrqHandles[3] );
+	}
+
+    /* Check for Rx IRQ */
+	if( 0 != (status & USART_ISR_RXNE) )
+	{
+		UartIsrRx( g_UartIrqHandles[3] );
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

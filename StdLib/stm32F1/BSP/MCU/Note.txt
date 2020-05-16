@@ -1,0 +1,1 @@
+This folder consist of ARM CMSIS and specified MCU header files. It might need to update if newer version available.
